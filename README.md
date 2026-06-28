@@ -1,123 +1,78 @@
-# NorthCast AI (Temporary README)
+# NorthCast — Northern Ontario Winter Road Risk Dashboard
 
-## AI4Good Lab Project
+Streamlit app that maps predicted ice conditions for **38 communities and lakes** in Northern Ontario, with vehicle load assessment for winter road planning.
 
-NorthCast AI is a machine learning mapping platform for social good.
-
-It predicts future ice stability on northern lakes to support earlier intervention for northern communities that are increasingly vulnerable to climate-driven transport disruptions.
-
-## Why This Matters
-
-Many northern communities rely on seasonal ice routes for transportation, supply access, and essential services. As climate patterns shift, ice conditions become less predictable, increasing safety and access risks.
-
-By forecasting changing lake ice stability, this project aims to help partners:
-
-- Improve risk awareness and planning
-- Support safer, earlier decision-making
-- Reduce disruptions to community mobility and logistics
-
-## Current Status
-
-This repository is in early development and this README is temporary.
-
-## Initial Project Goals
-
-- Build a data pipeline for historical and near-real-time environmental inputs
-- Train and evaluate ML models for ice stability forecasting
-- Provide map-based outputs for decision support
-- Communicate uncertainty clearly for operational use
-
-## Repository Contents
-
-- `app.py` - Main application entry point
-- `requirements.txt` - Python dependencies
-
-## How to Run
-
-1. Install dependencies:
+## Run
 
 ```bash
 pip install -r requirements.txt
-```
-
-2. Start the app with Streamlit:
-
-```bash
 streamlit run app.py
 ```
 
-## How Real-Time Forecasting Works
+## What it does
 
-When the **🌐 Real-Time Weather** toggle is enabled and the selected forecast date falls within today + 7 days, the app fetches live weather data and runs it through a physics-based ice condition scorer. Here is how the pipeline works end-to-end.
+- **Map** — Satellite view with colour-coded markers (load status: Safe / Borderline / Unsafe)
+- **Forecast date** — One date at a time (2025–2035 in scenario mode, or today + 7 days with live weather)
+- **Climate scenarios** — Optimistic, Baseline, High Emissions (SSP)
+- **Vehicle / load type** — Select one weight class; ice thickness is compared to minimum required ice for that vehicle
+- **Ice Condition Predictor** — Sidebar MLP (`final_mlp5_model.keras`) for custom inputs (temp, wind, snow, FDD)
+- **Community search** — Find lakes/communities and view detail panel + summary table
 
-### 1. Data Fetch — Open-Meteo API
+## Data sources
 
-The app fires 30 HTTP requests in parallel (10 at a time) to the [Open-Meteo](https://open-meteo.com/) free forecast API — one per community. Each request retrieves the following daily variables:
+| Mode | Source |
+|------|--------|
+| Real-time (toggle on, date within 7 days) | [Open-Meteo](https://open-meteo.com/) — temp, wind, snow, precipitation, cumulative FDD |
+| Scenario / outside live window | Deterministic placeholder model (`fake_predict`) until full feature table is connected |
 
-| Variable | Description |
-|---|---|
-| `temperature_2m_mean` | Daily mean air temperature |
-| `windspeed_10m_max` | Max wind speed (m/s) |
-| `precipitation_sum` | Total precipitation (mm) |
-| `snowfall_sum` | Snowfall (cm water-equivalent) |
-| `snow_depth` | Snow depth on ground (m) |
+## Models
 
-Each request also pulls **92 days of historical data** alongside the 7-day forecast, providing a continuous daily temperature record back to roughly October 1 — the start of the freeze season. Results are cached for **1 hour** so subsequent interactions are instant.
+| Model | Use |
+|-------|-----|
+| `final_mlp5_model.keras` + `feature_scaler_05.pkl` | Sidebar user-input predictor (NumPy inference, no TensorFlow) |
+| `final_mlp_model.pkl` | Full map model — not wired yet (needs per-lake feature CSV) |
 
-### 2. Cumulative Freezing Degree-Days (FDD)
+## Technical
 
-For each community, the app walks the historical temperature record from **October 1** of the current freeze season up to the selected date and accumulates negative degree-days:
+**Stack:** Python · Streamlit · Folium (Esri satellite tiles) · Pandas · scikit-learn · NumPy/h5py
 
-```
-FDD += max(0, -T_mean)  for each day where T_mean < 0°C
-```
+**Sidebar MLP** (`final_mlp5_model.keras`)
+- Architecture: Dense 32 → ReLU → Dropout → Dense 16 → ReLU → Dense 8 → ReLU → Dense 1 (linear)
+- Inputs (5, `StandardScaler`): `sd`, `d2m`, `sqrt_cum_fdd`, `t2m_c`, `wind_speed`
+- Output: ice depth in metres → converted to cm; missing inputs use training-set means
+- Inference via `mlp_inference.py` (weights read from `.keras` archive, no TensorFlow runtime)
 
-This cumulative cold total is the physical input that drives ice growth via Stefan's law.
+**Full map MLP** (`final_mlp_model.pkl`) — planned
+- 8 features: `t2m_c`, `d2m`, `wind_speed`, `msl`, `sd`, `tcc`, `cum_fdd`, `sqrt_cum_fdd`
+- Requires a per-lake, per-date feature table before replacing `fake_predict()`
 
-### 3. Ice Condition Prediction
+**Map prediction (current)**
+- **Scenario mode:** MD5-seeded `fake_predict()` — monthly state weights + SSP scenario shift + year drift
+- **Real-time mode:** Open-Meteo fetch (30 parallel requests, 1 h cache, 92 days history + 7-day forecast)
+  - Cumulative FDD from Oct 1: `FDD += max(0, −T)` for days where `T < 0°C`
+  - Ice thickness (Stefan): `h_cm ≈ 3.4 × √FDD`
+  - State from rule-based `whatif_predict()` (FDD, temp, snow, wind, precip → score 0–100)
 
-Each community's live weather variables are fed into a rule-based scorer (`whatif_predict`):
+**Derived labels**
+| Step | Rule |
+|------|------|
+| Ice state | ≥ 30 cm → Frozen · ≥ 15 cm → Unstable · else Open |
+| Risk score | `100 − min(100, ice_cm / 60 × 100)` |
+| Load status | ice ≥ threshold → Safe · ≥ 85% threshold → Borderline · else Unsafe |
 
-| Variable | Max contribution | Physical reasoning |
-|---|---|---|
-| Cumulative FDD | +50 pts | Primary ice-growth driver (Stefan's law) |
-| Air temperature | +25 pts | Cold = safer, stable ice |
-| Snow depth | +15 pts | Insulation slows melt |
-| Wind speed | −10 pts | Turbulence destabilises forming ice |
-| Precipitation | −10 pts | Rainfall accelerates melt |
+**Vehicle thresholds (cm):** light truck 20.3 · medium 25.4 · heavy 30.5 · 10 t 38.1 · 25 t 50.8 · 70 t 76.2 · 110 t 91.4
 
-The total score (0–100) maps to one of three states: **Frozen**, **Unstable**, or **Open**. The risk score is placed within the corresponding band (e.g. Frozen → 5–35).
+## Files
 
-Ice thickness is estimated using **Stefan's law**:
+- `app.py` — Main dashboard
+- `mlp_inference.py` — NumPy MLP loader
+- `*.pkl`, `*.keras` — Trained models and scalers
 
-```
-h_cm ≈ 3.4 × √FDD
-```
+## Notes
 
-This is the standard empirical formula for black ice growth in still water.
-
-### 4. Map Display
-
-The resulting predictions drive the same colour-coded circle markers as the scenario mode. When a community has live data, its map popup switches from scenario fields to the actual weather variables (air temp, wind, snow depth, precipitation, cumulative FDD, estimated ice thickness) and shows a green **⬤ Live · Open-Meteo** badge.
-
-### Known Limitations
-
-- **Rule-based scorer, not ML**: `whatif_predict` is a hand-tuned physics approximation, not the trained `ice_model.pkl`. Results are physically plausible but not calibrated against observed ice conditions.
-- **No rain/snow distinction**: `precipitation_sum` includes both rain and snow. Rain is treated as a melt risk even in deep winter, which slightly underestimates safety during heavy-snowfall periods.
-- **Seasonal relevance**: Cumulative FDD since October 1 is near zero in summer, so all communities will correctly show "Open" outside of the November–March winter road season.
-- **Stefan's law assumptions**: The ice thickness estimate applies to ideal black ice in still, clear water. It overpredicts thickness on rivers and underpredicts on shallow, wind-sheltered lakes.
-
-## Next Steps (Planned)
-
-- Define model inputs and feature engineering workflow
-- Add training/evaluation scripts and metrics
-- Build a minimal map visualization interface
-- Add documentation for setup, data sources, and usage
+- Load thresholds are **planning indicators** for one vehicle type at a time — not convoy count, spacing, or local authority rules.
+- Beyond 2030, treat outputs as climate-risk scenarios, not exact forecasts.
 
 ## License
 
 TBD
-
-## Contact
-
-AI4Good Lab project team
